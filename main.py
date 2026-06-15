@@ -1,12 +1,18 @@
+import os
+import requests
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from sqlalchemy import Column, Integer, String, ForeignKey, create_engine
+from sqlalchemy import Column, Integer, String, ForeignKey, create_engine, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from passlib.context import CryptContext
 import jwt
 from datetime import datetime, timedelta, timezone
+from dotenv import load_dotenv
+
+load_dotenv()
+SPORTS_API_KEY = os.getenv("SPORTS_API_KEY")
 
 DATABASE_URL = "postgresql://localhost/analytics"
 SECRET_KEY = "super_secret_key_change_this_in_production"
@@ -60,7 +66,7 @@ class MatchModel(Base):
     away_team_id = Column(Integer, ForeignKey("teams.id"))
     home_score = Column(Integer)
     away_score = Column(Integer)
-    
+
 Base.metadata.create_all(bind=engine)
 
 class UserCreate(BaseModel):
@@ -110,7 +116,7 @@ class MatchResponse(BaseModel):
     class Config:
         from_attributes = True
 
-app = FastAPI(title="Match Analytics Hub")
+app = FastAPI(title="FootballDB")
 
 def get_db():
     db = SessionLocal()
@@ -137,7 +143,6 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if user is None:
         raise credentials_exception
     return user
-
 
 @app.post("/register", response_model=Token)
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -170,9 +175,40 @@ def get_teams(db: Session = Depends(get_db)):
 def get_matches(db: Session = Depends(get_db)):
     return db.query(MatchModel).all()
 
+@app.get("/standings/{league_code}")
+def get_standings(league_code: str):
+    url = f"https://api.football-data.org/v4/competitions/{league_code}/standings"
+    headers = {"X-Auth-Token": SPORTS_API_KEY}
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch standings for {league_code}")
+        
+    data = response.json()
+    
+    try:
+        standings_table = data["standings"][0]["table"]
+        clean_standings = []
+        for row in standings_table:
+            clean_standings.append({
+                "Rank": row["position"],
+                "Club": row["team"]["name"],
+                "MP": row["playedGames"],
+                "W": row["won"],
+                "D": row["draw"],
+                "L": row["lost"],
+                "GF": row["goalsFor"],
+                "GA": row["goalsAgainst"],
+                "GD": row["goalDifference"],
+                "Pts": row["points"]
+            })
+        return clean_standings
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=404, detail="Standings data not available for this league")
+
 @app.post("/teams", response_model=TeamResponse)
 def create_team(team: TeamCreate, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
-    db_team = db.query(TeamModel).filter(TeamModel.name == team.name).first()
+    db_team = db.query(TeamModel).filter(or_(TeamModel.name == team.name, TeamModel.code == team.code)).first()
     if db_team:
         raise HTTPException(status_code=400, detail="Team already registered")
     new_team = TeamModel(name=team.name, code=team.code)
@@ -213,3 +249,114 @@ def create_match(match: MatchCreate, db: Session = Depends(get_db), current_user
     db.commit()
     db.refresh(new_match)
     return new_match
+
+@app.delete("/matches/{match_id}")
+def delete_match(match_id: int, db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    match = db.query(MatchModel).filter(MatchModel.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    db.delete(match)
+    db.commit()
+    return {"message": f"Match {match_id} successfully deleted"}
+
+@app.post("/sync/matches")
+def sync_external_matches(league_code: str = "WC", db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    url = f"https://api.football-data.org/v4/competitions/{league_code}/matches"
+    headers = {"X-Auth-Token": SPORTS_API_KEY}
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch data for {league_code}. Check your API key or league code.")
+        
+    data = response.json()
+    matches_data = data.get("matches", [])
+    
+    added_count = 0
+    
+    for match in matches_data:
+        if match.get("status") != "FINISHED":
+            continue
+            
+        home_name = match["homeTeam"]["name"]
+        home_code = match["homeTeam"].get("tla", home_name[:3].upper())
+        away_name = match["awayTeam"]["name"]
+        away_code = match["awayTeam"].get("tla", away_name[:3].upper())
+        
+        home_team = db.query(TeamModel).filter(or_(TeamModel.name == home_name, TeamModel.code == home_code)).first()
+        if not home_team:
+            home_team = TeamModel(name=home_name, code=home_code)
+            db.add(home_team)
+            db.commit()
+            db.refresh(home_team)
+            
+        away_team = db.query(TeamModel).filter(or_(TeamModel.name == away_name, TeamModel.code == away_code)).first()
+        if not away_team:
+            away_team = TeamModel(name=away_name, code=away_code)
+            db.add(away_team)
+            db.commit()
+            db.refresh(away_team)
+            
+        home_score = match["score"]["fullTime"]["home"]
+        away_score = match["score"]["fullTime"]["away"]
+        
+        existing_match = db.query(MatchModel).filter(
+            MatchModel.home_team_id == home_team.id,
+            MatchModel.away_team_id == away_team.id
+        ).first()
+        
+        if not existing_match:
+            new_match = MatchModel(
+                home_team_id=home_team.id, away_team_id=away_team.id,
+                home_score=home_score, away_score=away_score
+            )
+            db.add(new_match)
+            db.commit()
+            added_count += 1
+            
+    return {"message": f"Successfully synced {added_count} finished {league_code} matches!"}
+
+
+@app.post("/sync/players")
+def sync_external_players(league_code: str = "WC", db: Session = Depends(get_db), current_user: UserModel = Depends(get_current_user)):
+    url = f"https://api.football-data.org/v4/competitions/{league_code}/teams"
+    headers = {"X-Auth-Token": SPORTS_API_KEY}
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch teams. Code: {response.status_code}")
+        
+    data = response.json()
+    teams_data = data.get("teams", [])
+    added_players = 0
+    
+    for team_data in teams_data:
+        team_name = team_data["name"]
+        team_code = team_data.get("tla", team_name[:3].upper())
+        
+        team = db.query(TeamModel).filter(or_(TeamModel.name == team_name, TeamModel.code == team_code)).first()
+        if not team:
+            team = TeamModel(name=team_name, code=team_code)
+            db.add(team)
+            db.commit()
+            db.refresh(team)
+            
+        squad = team_data.get("squad", [])
+        for player in squad:
+            player_name = player.get("name")
+            player_position = player.get("position", "Unknown")
+            if not player_name: 
+                continue
+            
+            existing_player = db.query(PlayerModel).filter(
+                PlayerModel.name == player_name, PlayerModel.team_id == team.id
+            ).first()
+            
+            if not existing_player:
+                new_player = PlayerModel(name=player_name, position=player_position, team_id=team.id)
+                db.add(new_player)
+                added_players += 1
+        
+        db.commit() 
+        
+    return {"message": f"Successfully synced {added_players} players for {league_code}!"}

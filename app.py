@@ -1,90 +1,134 @@
 import streamlit as st
 import requests
+import pandas as pd
 
 API_URL = "http://127.0.0.1:8000"
 
-st.set_page_config(page_title="FootballDB", layout="wide")
-st.title("FootballDB")
+st.set_page_config(page_title="FootballDB", layout="wide", page_icon="⚽")
+st.title("⚽ FootballDB")
 
-menu = ["Public Dashboard", "Admin Panel"]
+@st.cache_data(ttl=300)
+def get_league_data(league_code):
+    try:
+        res = requests.get(f"{API_URL}/standings/{league_code}")
+        if res.status_code == 200:
+            return res.json()
+    except requests.exceptions.ConnectionError:
+        return None
+    return None
+
+menu = ["Live Standings", "Admin Panel"]
 choice = st.sidebar.selectbox("Navigation", menu)
 
-if choice == "Public Dashboard":
-    st.header("Current Standings & Match Results")
+if choice == "Live Standings":
+    st.header("📊 European League Standings")
     
-    col1, col2 = st.columns(2)
+    try:
+        db_teams_res = requests.get(f"{API_URL}/teams")
+        internal_teams = db_teams_res.json() if db_teams_res.status_code == 200 else []
+    except requests.exceptions.ConnectionError:
+        st.error("Backend server offline. Please start your FastAPI server.")
+        internal_teams = []
     
-    with col1:
-        st.subheader("Registered Teams")
-        try:
-            teams_res = requests.get(f"{API_URL}/teams")
-            if teams_res.status_code == 200:
-                teams = teams_res.json()
-                for team in teams:
-                    st.write(f"**{team['name']}** ({team['code']})")
-                    if team["players"]:
-                        player_names = [p["name"] for p in team["players"]]
-                        st.caption(f"Squad: {', '.join(player_names)}")
-            else:
-                st.error("Failed to fetch teams.")
-        except requests.exceptions.ConnectionError:
-            st.error("Backend server is offline.")
+    leagues = {
+        "Champions League": "CL",
+        "Premier League": "PL",
+        "La Liga": "PD",
+        "Serie A": "SA",
+        "Bundesliga": "BL1",
+        "Ligue 1": "FL1"
+    }
+    
+    tabs = st.tabs(list(leagues.keys()))
+    
+    for tab, (league_name, league_code) in zip(tabs, leagues.items()):
+        with tab:
+            st.subheader(f"{league_name} Table")
+            
+            with st.spinner(f"Fetching live data for {league_name}..."):
+                standings_data = get_league_data(league_code)
+                
+            if standings_data:
+                df = pd.DataFrame(standings_data)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+                
+                st.markdown("---")
+                st.subheader("🔎 Team Spotlight")
+                
+                club_list = df["Club"].tolist()
+                selected_club = st.selectbox(
+                    f"Select a club to view their roster:", 
+                    club_list, 
+                    key=f"select_{league_code}"
+                )
+                
+                matched_team = next((t for t in internal_teams if t["name"] == selected_club), None)
+                
+                if matched_team:
+                    if matched_team.get("players"):
+                        st.success(f"Found {len(matched_team['players'])} players in database.")
+                        
+                        p_cols = st.columns(4)
+                        for idx, player in enumerate(matched_team["players"]):
+                            with p_cols[idx % 4]:
+                                st.markdown(f"**{player['name']}** \n*{player['position']}*")
+                    else:
+                        st.warning(f"We have {selected_club} in the database, but their squad list is empty. Run a Player Sync in the Admin Panel.")
+                else:
+                    st.info(f"{selected_club} is not in your PostgreSQL database yet. Go to the Admin Panel and sync the {league_code} players!")
 
-    with col2:
-        st.subheader("Match History")
-        try:
-            matches_res = requests.get(f"{API_URL}/matches")
-            if matches_res.status_code == 200:
-                matches = matches_res.json()
-                for match in matches:
-                    st.info(f"Team {match['home_team_id']}  [{match['home_score']} - {match['away_score']}]  Team {match['away_team_id']}")
             else:
-                st.error("Failed to fetch matches.")
-        except requests.exceptions.ConnectionError:
-            st.error("Backend server is offline.")
+                st.error("Failed to load data. Rate limit reached. Wait a minute and refresh.")
 
 elif choice == "Admin Panel":
-    st.header("Admin Portal")
+    st.header("🔒 Admin Portal")
     
     if "token" not in st.session_state:
         st.session_state["token"] = None
 
     if not st.session_state["token"]:
-        st.subheader("Login to Access Protected Actions")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        
-        if st.button("Login"):
-            res = requests.post(f"{API_URL}/login", data={"username": username, "password": password})
-            if res.status_code == 200:
-                st.session_state["token"] = res.json()["access_token"]
-                st.success("Logged in successfully!")
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
+        with st.form("login_form"):
+            st.subheader("Login to Access Protected Actions")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login")
+            
+            if submitted:
+                res = requests.post(f"{API_URL}/login", data={"username": username, "password": password})
+                if res.status_code == 200:
+                    st.session_state["token"] = res.json()["access_token"]
+                    st.success("Logged in successfully!")
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials.")
     else:
-        if st.button("Logout"):
+        col1, col2 = st.columns([0.8, 0.2])
+        col1.write("Authentication Active. You have admin privileges.")
+        if col2.button("Logout"):
             st.session_state["token"] = None
             st.rerun()
             
         st.write("---")
-        st.subheader("Log a New Match")
+        st.subheader("Database Synchronization")
+        st.write("Use these controls to pull live data from the sports API into your PostgreSQL database.")
         
-        home_id = st.number_input("Home Team ID", min_value=1, step=1)
-        away_id = st.number_input("Away Team ID", min_value=1, step=1)
-        home_score = st.number_input("Home Score", min_value=0, step=1)
-        away_score = st.number_input("Away Score", min_value=0, step=1)
+        sync_league = st.text_input("League Code to Sync (e.g., PL, PD, CL)", value="PL")
         
-        if st.button("Submit Match Result"):
+        c1, c2 = st.columns(2)
+        if c1.button("Sync Players"):
             headers = {"Authorization": f"Bearer {st.session_state['token']}"}
-            match_data = {
-                "home_team_id": home_id,
-                "away_team_id": away_id,
-                "home_score": home_score,
-                "away_score": away_score
-            }
-            res = requests.post(f"{API_URL}/matches", json=match_data, headers=headers)
-            if res.status_code == 200:
-                st.success("Match saved directly to PostgreSQL backend!")
-            else:
-                st.error(f"Error: {res.json().get('detail')}")
+            with st.spinner(f"Syncing players for {sync_league}..."):
+                res = requests.post(f"{API_URL}/sync/players?league_code={sync_league}", headers=headers)
+                if res.status_code == 200:
+                    st.success(res.json().get("message"))
+                else:
+                    st.error(f"Error: {res.json().get('detail')}")
+                
+        if c2.button("Sync Matches"):
+            headers = {"Authorization": f"Bearer {st.session_state['token']}"}
+            with st.spinner(f"Syncing matches for {sync_league}..."):
+                res = requests.post(f"{API_URL}/sync/matches?league_code={sync_league}", headers=headers)
+                if res.status_code == 200:
+                    st.success(res.json().get("message"))
+                else:
+                    st.error(f"Error: {res.json().get('detail')}")
